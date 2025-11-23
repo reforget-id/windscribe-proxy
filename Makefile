@@ -5,14 +5,13 @@ BUILDOPTS = -a -tags netgo -trimpath -asmflags -trimpath
 LDFLAGS = -ldflags '-s -w -extldflags "-static" -X main.version=$(VERSION)'
 LDFLAGS_NATIVE = -ldflags '-s -w -X main.version=$(VERSION)'
 
-NDK_CC_ARM = $(abspath ../../ndk-toolchain-arm/bin/arm-linux-androideabi-gcc)
 NDK_CC_ARM64 = $(abspath ../../ndk-toolchain-arm64/bin/aarch64-linux-android21-clang)
 
 GO := go
 
 src = $(wildcard *.go */*.go */*/*.go) go.mod go.sum
 
-# native: bin-native
+native: bin-native
 # all: bin-linux-amd64 bin-linux-386 bin-linux-arm bin-linux-arm64 \
 # 	bin-linux-mips bin-linux-mipsle bin-linux-mips64 bin-linux-mips64le \
 # 	bin-freebsd-amd64 bin-freebsd-386 bin-freebsd-arm bin-freebsd-arm64 \
@@ -21,12 +20,12 @@ src = $(wildcard *.go */*.go */*/*.go) go.mod go.sum
 # 	bin-darwin-amd64 bin-darwin-arm64 \
 # 	bin-windows-amd64 bin-windows-386 bin-windows-arm
 
-# allplus: all \
-# 	bin-android-arm bin-android-arm64
+all: bin-linux-amd64 bin-windows-amd64 
 
-all: bin-linux-amd64 bin-windows-amd64 bin-android-arm64
+allplus: all \
+ 	bin-android-arm64
 
-# bin-native: $(OUTSUFFIX)
+bin-native: $(OUTSUFFIX)
 bin-linux-amd64: $(OUTSUFFIX).linux-amd64
 # bin-linux-386: $(OUTSUFFIX).linux-386
 # bin-linux-arm: $(OUTSUFFIX).linux-arm
