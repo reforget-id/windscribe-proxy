@@ -10,6 +10,9 @@ By default the application listens on 127.0.0.1:28080.
 
 * Cross-platform (Windows/Mac OS/Linux/Android (via shell)/\*BSD)
 * Uses TLS for secure communication with upstream proxies
+* DNS tunneling through Windscribe servers (queries appear from server location)
+* Auto-detection of Windows DNS configuration (including DoH)
+* Support for custom DoH upstream resolvers
 * Zero configuration
 * Simple and straightforward
 
@@ -60,6 +63,28 @@ Also it is possible to export proxy addresses and credentials:
 windscribe-proxy -list-proxies
 ```
 
+### DNS Tunneling
+
+By default, windscribe-proxy routes all DNS queries through the Windscribe tunnel, making DNS requests appear to originate from the Windscribe server location rather than your local IP address. This enhances privacy and allows integration with DNS-based filtering services like NextDNS.
+
+**Auto-detection mode** (default on Windows):
+```
+windscribe-proxy -location Germany/Frankfurt
+```
+This will automatically detect your Windows DNS configuration, including DoH endpoints, and route queries through the tunnel.
+
+**Custom DoH upstream**:
+```
+windscribe-proxy -location Germany/Frankfurt -resolver https://dns.nextdns.io/abc123
+```
+This routes DNS queries through the specified DoH provider via the Windscribe tunnel.
+
+**How it works**:
+1. DNS queries are intercepted and sent through the Windscribe VPN tunnel
+2. The Windscribe server forwards queries to the configured upstream resolver (auto-detected or specified via `-resolver`)
+3. DNS responses appear to come from the Windscribe server location
+4. If DoH upstream fails, automatically falls back to TCP DNS (Google DNS, Cloudflare DNS, Quad9)
+
 ## List of arguments
 
 | Argument | Type | Description |
@@ -77,7 +102,7 @@ windscribe-proxy -list-proxies
 | location | String | desired proxy location. Default: best location |
 | password | String | password for login |
 | proxy | String | sets base proxy to use for all dial-outs. Format: `<http\|https\|socks5\|socks5h>://[login:password@]host[:port]` Examples: `http://user:password@192.168.1.1:3128`, `socks5://10.0.0.1:1080` |
-| resolver | String | Use DNS/DoH/DoT/DoQ resolver for all dial-outs. See https://github.com/ameshkov/dnslookup/ for upstream DNS URL format. Examples: `https://1.1.1.1/dns-query`, `quic://dns.adguard.com` |
+| resolver | String | DoH upstream resolver to use via Windscribe tunnel. If not specified, auto-detects Windows DNS configuration. DNS queries will be sent from Windscribe server location. Examples: `https://dns.nextdns.io/abc123`, `https://1.1.1.1/dns-query` |
 | state-file | String | file name used to persist Windscribe API client state. Default: `wndstate.json` |
 | timeout | Duration | timeout for network operations. Default: `10s` |
 | username | String | username for login |
