@@ -6,7 +6,6 @@ import (
 	"io"
 	"log"
 	"net"
-	"net/netip"
 	"testing"
 	"time"
 
