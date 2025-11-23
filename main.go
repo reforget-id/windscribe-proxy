@@ -80,11 +80,11 @@ func parse_args() CLIArgs {
 	flag.StringVar(&args.proxy, "proxy", "", "sets base proxy to use for all dial-outs. "+
 		"Format: <http|https|socks5|socks5h>://[login:password@]host[:port] "+
 		"Examples: http://user:password@192.168.1.1:3128, socks5://10.0.0.1:1080")
-	// TODO: implement DNS resolving or remove it
 	flag.StringVar(&args.resolver, "resolver", "",
-		"Use DNS/DoH/DoT/DoQ resolver for all dial-outs. "+
-			"See https://github.com/ameshkov/dnslookup/ for upstream DNS URL format. "+
-			"Examples: https://1.1.1.1/dns-query, quic://dns.adguard.com")
+		"DoH upstream resolver to use via Windscribe tunnel. "+
+			"If not specified, auto-detects Windows DNS configuration. "+
+			"DNS queries will be sent from Windscribe server location. "+
+			"Examples: https://dns.nextdns.io/abc123, https://1.1.1.1/dns-query")
 	flag.StringVar(&args.caFile, "cafile", "", "use custom CA certificate bundle file")
 	flag.StringVar(&args.clientAuthSecret, "auth-secret", DEFAULT_CLIENT_AUTH_SECRET, "client auth secret")
 	flag.StringVar(&args.stateFile, "state-file", "wndstate.json", "file name used to persist "+
@@ -129,9 +129,6 @@ func run() int {
 	proxyLogger := NewCondLogger(log.New(logWriter, "PROXY   : ",
 		log.LstdFlags|log.Lshortfile),
 		args.verbosity)
-	resolverLogger := NewCondLogger(log.New(logWriter, "RESOLVER: ",
-		log.LstdFlags|log.Lshortfile),
-		args.verbosity)
 
 	mainLogger.Info("windscribe-proxy client version %s is starting...", version)
 
@@ -170,14 +167,7 @@ func run() int {
 		dialer = pxDialer.(ContextDialer)
 	}
 
-	if args.resolver != "" {
-		dialer, err = NewResolvingDialer(args.resolver, args.timeout, dialer, resolverLogger)
-		if err != nil {
-			mainLogger.Critical("Unable to instantiate resolver: %v", err)
-			return 5
-		}
-	}
-
+	// Keep base dialer for Windscribe API calls (should not use tunnel resolver)
 	wndclientDialer := dialer
 
 	wndc, err := wndclient.NewWndClient(&http.Transport{
@@ -271,8 +261,37 @@ func run() int {
 	proxyNetAddr := net.JoinHostPort(proxyHostname, strconv.FormatUint(uint64(ASSUMED_PROXY_PORT), 10))
 	handlerDialer := NewProxyDialer(proxyNetAddr, proxyHostname, args.fakeSNI, auth, caPool, dialer)
 	mainLogger.Info("Endpoint: %s", proxyNetAddr)
+
+	// Apply DNS resolver through tunnel (after ProxyDialer is set up)
+	// This routes all DNS queries through the Windscribe server
+	var finalDialer ContextDialer = handlerDialer
+	dohUpstream := args.resolver
+
+	// Auto-detect Windows DNS if resolver not specified
+	if dohUpstream == "" {
+		mainLogger.Info("No -resolver specified, attempting to auto-detect Windows DNS configuration...")
+		dohUpstream = DetectWindowsDNS(mainLogger)
+		if dohUpstream != "" {
+			mainLogger.Info("Using auto-detected DoH upstream: %s", dohUpstream)
+		} else {
+			mainLogger.Info("No DoH configuration detected, will use TCP DNS through tunnel")
+		}
+	} else {
+		mainLogger.Info("Using specified resolver: %s", dohUpstream)
+	}
+
+	// Always use tunnel resolver (with or without custom DoH upstream)
+	tunnelResolverLogger := NewCondLogger(log.New(logWriter, "TUNLDNS : ",
+		log.LstdFlags|log.Lshortfile),
+		args.verbosity)
+	finalDialer, err = NewTunnelResolvingDialer(dohUpstream, args.timeout, handlerDialer, tunnelResolverLogger)
+	if err != nil {
+		mainLogger.Critical("Unable to instantiate tunnel resolver: %v", err)
+		return 14
+	}
+
 	mainLogger.Info("Starting proxy server...")
-	handler := NewProxyHandler(handlerDialer, proxyLogger)
+	handler := NewProxyHandler(finalDialer, proxyLogger)
 	mainLogger.Info("Init complete.")
 	err = http.ListenAndServe(args.bindAddress, handler)
 	mainLogger.Critical("Server terminated with a reason: %v", err)
