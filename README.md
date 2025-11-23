@@ -12,6 +12,7 @@ By default the application listens on 127.0.0.1:28080.
 * Uses TLS for secure communication with upstream proxies
 * Zero configuration
 * Simple and straightforward
+* DNS routing via Windscribe tunnel - DNS queries originate from the Windscribe server location, not your actual location
 
 ## Installation
 
@@ -60,6 +61,14 @@ Also it is possible to export proxy addresses and credentials:
 windscribe-proxy -list-proxies
 ```
 
+Use custom DoH resolver (like NextDNS) via Windscribe tunnel:
+
+```
+windscribe-proxy -doh-upstream https://dns.nextdns.io/abc123
+```
+
+This ensures your DNS queries appear to come from the Windscribe server location, not your actual location.
+
 ## List of arguments
 
 | Argument | Type | Description |
@@ -68,6 +77,7 @@ windscribe-proxy -list-proxies
 | auth-secret | String | client auth secret (default `952b4412f002315aa50751032fcaab03`) |
 | bind-address | String | HTTP proxy listen address (default `127.0.0.1:28080`) |
 | cafile | String | use custom CA certificate bundle file |
+| doh-upstream | String | DoH upstream resolver to use via Windscribe tunnel. DNS queries will be sent from Windscribe server location. Falls back to Windscribe DNS if upstream fails. Examples: `https://dns.nextdns.io/abc123`, `https://1.1.1.1/dns-query`. Can also be set via `DOH_UPSTREAM` environment variable. |
 | fake-sni | String | fake SNI to use to contact windscribe servers (default "com") |
 | force-cold-init | - | force cold init |
 | init-retries | Number | number of attempts for initialization steps, zero for unlimited retry |
