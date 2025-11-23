@@ -55,6 +55,7 @@ type CLIArgs struct {
 	showVersion       bool
 	proxy             string
 	resolver          string
+	ipPreference      IPPreference
 	caFile            string
 	clientAuthSecret  string
 	stateFile         string
@@ -69,6 +70,7 @@ type CLIArgs struct {
 
 func parse_args() CLIArgs {
 	var args CLIArgs
+	ipPref := IPPreferenceIPv4First
 	flag.StringVar(&args.location, "location", "", "desired proxy location. Default: best location")
 	flag.BoolVar(&args.listLocations, "list-locations", false, "list available locations and exit")
 	flag.BoolVar(&args.listProxies, "list-proxies", false, "output proxy list and exit")
@@ -85,6 +87,7 @@ func parse_args() CLIArgs {
 		"Use DNS/DoH/DoT/DoQ resolver for all dial-outs. "+
 			"See https://github.com/ameshkov/dnslookup/ for upstream DNS URL format. "+
 			"Examples: https://1.1.1.1/dns-query, quic://dns.adguard.com")
+	flag.Var(&ipPref, "ip-preference", "IP address selection preference (ipv4-first, ipv6-first, ipv4-only, ipv6-only)")
 	flag.StringVar(&args.caFile, "cafile", "", "use custom CA certificate bundle file")
 	flag.StringVar(&args.clientAuthSecret, "auth-secret", DEFAULT_CLIENT_AUTH_SECRET, "client auth secret")
 	flag.StringVar(&args.stateFile, "state-file", "wndstate.json", "file name used to persist "+
@@ -100,6 +103,7 @@ func parse_args() CLIArgs {
 	if args.listLocations && args.listProxies {
 		arg_fail("list-locations and list-proxies flags are mutually exclusive")
 	}
+	args.ipPreference = ipPref
 	return args
 }
 
@@ -170,13 +174,12 @@ func run() int {
 		dialer = pxDialer.(ContextDialer)
 	}
 
-	if args.resolver != "" {
-		dialer, err = NewResolvingDialer(args.resolver, args.timeout, dialer, resolverLogger)
-		if err != nil {
-			mainLogger.Critical("Unable to instantiate resolver: %v", err)
-			return 5
-		}
+	resolvingDialer, err := NewResolvingDialer(args.resolver, args.timeout, dialer, resolverLogger, args.ipPreference)
+	if err != nil {
+		mainLogger.Critical("Unable to instantiate resolver: %v", err)
+		return 5
 	}
+	dialer = resolvingDialer
 
 	wndclientDialer := dialer
 
@@ -272,7 +275,7 @@ func run() int {
 	handlerDialer := NewProxyDialer(proxyNetAddr, proxyHostname, args.fakeSNI, auth, caPool, dialer)
 	mainLogger.Info("Endpoint: %s", proxyNetAddr)
 	mainLogger.Info("Starting proxy server...")
-	handler := NewProxyHandler(handlerDialer, proxyLogger)
+	handler := NewProxyHandler(handlerDialer, resolvingDialer, args.ipPreference, proxyLogger)
 	mainLogger.Info("Init complete.")
 	err = http.ListenAndServe(args.bindAddress, handler)
 	mainLogger.Critical("Server terminated with a reason: %v", err)
