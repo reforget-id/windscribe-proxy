@@ -14,6 +14,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strings"
+	"time"
 )
 
 const (
@@ -95,6 +96,16 @@ func (d *ProxyDialer) DialContext(ctx context.Context, network, address string) 
 	if err != nil {
 		return nil, err
 	}
+	// Bound TLS handshake and CONNECT exchange by the caller's context deadline
+	if deadline, ok := ctx.Deadline(); ok {
+		conn.SetDeadline(deadline)
+	}
+	ok := false
+	defer func() {
+		if !ok {
+			conn.Close()
+		}
+	}()
 
 	if d.tlsServerName != "" {
 		// Custom cert verification logic:
@@ -109,6 +120,9 @@ func (d *ProxyDialer) DialContext(ctx context.Context, network, address string) 
 					DNSName:       d.tlsServerName,
 					Intermediates: x509.NewCertPool(),
 					Roots:         d.caPool,
+				}
+				if len(cs.PeerCertificates) == 0 {
+					return errors.New("no peer certificates presented")
 				}
 				for _, cert := range cs.PeerCertificates[1:] {
 					opts.Intermediates.AddCert(cert)
@@ -151,9 +165,11 @@ func (d *ProxyDialer) DialContext(ctx context.Context, network, address string) 
 	}
 
 	if proxyResp.StatusCode != http.StatusOK {
-		return nil, errors.New(fmt.Sprintf("bad response from upstream proxy server: %s", proxyResp.Status))
+		return nil, fmt.Errorf("bad response from upstream proxy server: %s", proxyResp.Status)
 	}
 
+	conn.SetDeadline(time.Time{})
+	ok = true
 	return conn, nil
 }
 
@@ -210,6 +226,7 @@ func (d *FakeSNIDialer) DialTLSContext(ctx context.Context, network, addr string
 
 	name, _, err := net.SplitHostPort(addr)
 	if err != nil {
+		conn.Close()
 		return nil, err
 	}
 
@@ -223,15 +240,15 @@ func (d *FakeSNIDialer) DialTLSContext(ctx context.Context, network, addr string
 				Intermediates: x509.NewCertPool(),
 				Roots:         d.caPool,
 			}
+			if len(cs.PeerCertificates) == 0 {
+				return errors.New("no peer certificates presented")
+			}
 			for _, cert := range cs.PeerCertificates[1:] {
 				opts.Intermediates.AddCert(cert)
 			}
 			_, err := cs.PeerCertificates[0].Verify(opts)
 			return err
 		},
-	}
-	if err != nil {
-		return conn, err
 	}
 	return tls.Client(conn, tlsConfig), nil
 }

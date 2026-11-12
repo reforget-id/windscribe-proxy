@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -24,6 +25,7 @@ type TunnelResolvingDialer struct {
 	cache6      *ttlcache.Cache
 	logger      *CondLogger
 	useFallback bool
+	timeout     time.Duration
 }
 
 // NewTunnelResolvingDialer creates a resolver that routes DNS via the tunnel
@@ -62,6 +64,7 @@ func NewTunnelResolvingDialer(dohUpstream string, timeout time.Duration, next Co
 		cache6:      cache6,
 		logger:      logger,
 		useFallback: useFallback,
+		timeout:     timeout,
 	}
 
 	cache4.SetLoaderFunction(d.resolveA)
@@ -116,16 +119,31 @@ func (d *TunnelResolvingDialer) resolve(domain string, typ uint16) (string, time
 		return "", 0, err
 	}
 
+	if reply.Rcode != dns.RcodeSuccess {
+		return "", 0, fmt.Errorf("DNS query for %s failed: %s", domain, dns.RcodeToString[reply.Rcode])
+	}
+
 	// Parse response
 	for _, rr := range reply.Answer {
 		if a, ok := rr.(*dns.A); ok && typ == dns.TypeA {
-			return a.A.String(), (time.Second * time.Duration(a.Hdr.Ttl)), nil
+			return a.A.String(), cacheTTL(a.Hdr.Ttl), nil
 		}
 		if aaaa, ok := rr.(*dns.AAAA); ok && typ == dns.TypeAAAA {
-			return aaaa.AAAA.String(), (time.Second * time.Duration(aaaa.Hdr.Ttl)), nil
+			return aaaa.AAAA.String(), cacheTTL(aaaa.Hdr.Ttl), nil
 		}
 	}
 	return "", 0, errors.New("no data in DNS response")
+}
+
+// cacheTTL converts a DNS TTL to a cache duration. ttlcache treats a zero
+// TTL as "never expire", so zero-TTL records are clamped to a small minimum.
+func cacheTTL(ttl uint32) time.Duration {
+	const minTTL = 1 * time.Second
+	d := time.Duration(ttl) * time.Second
+	if d < minTTL {
+		return minTTL
+	}
+	return d
 }
 
 // queryDoH performs a DNS query over HTTPS
@@ -136,7 +154,9 @@ func (d *TunnelResolvingDialer) queryDoH(req *dns.Msg) (*dns.Msg, error) {
 	}
 
 	// Use DNS wire format over HTTPS (RFC 8484)
-	httpReq, err := http.NewRequest("POST", d.dohURL, bytes.NewReader(pack))
+	ctx, cancel := context.WithTimeout(context.Background(), d.timeout)
+	defer cancel()
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", d.dohURL, bytes.NewReader(pack))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create HTTP request: %w", err)
 	}
@@ -153,7 +173,7 @@ func (d *TunnelResolvingDialer) queryDoH(req *dns.Msg) (*dns.Msg, error) {
 		return nil, fmt.Errorf("DoH server returned status %d", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, dns.MaxMsgSize))
 	if err != nil {
 		return nil, fmt.Errorf("failed to read DoH response: %w", err)
 	}
@@ -166,81 +186,72 @@ func (d *TunnelResolvingDialer) queryDoH(req *dns.Msg) (*dns.Msg, error) {
 	return reply, nil
 }
 
+// Public DNS servers queried over TCP through the Windscribe tunnel
+var tcpDNSServers = []string{"8.8.8.8:53", "1.1.1.1:53", "9.9.9.9:53"}
+
 // queryTCP performs a DNS query over TCP (routed through tunnel)
-// Uses public DNS servers that will be routed through the Windscribe tunnel
 func (d *TunnelResolvingDialer) queryTCP(req *dns.Msg) (*dns.Msg, error) {
-	// Use common public DNS servers that will be routed through the tunnel
-	// Try Google DNS first, then Cloudflare, then Quad9
-	servers := []string{"8.8.8.8:53", "1.1.1.1:53", "9.9.9.9:53"}
+	pack, err := req.Pack()
+	if err != nil {
+		return nil, fmt.Errorf("failed to pack DNS message: %w", err)
+	}
 
 	var lastErr error
-	for _, server := range servers {
-		conn, err := d.next.DialContext(context.Background(), "tcp", server)
+	for _, server := range tcpDNSServers {
+		reply, err := d.queryTCPServer(server, pack)
 		if err != nil {
-			lastErr = fmt.Errorf("failed to dial %s: %w", server, err)
-			d.logger.Debug("Failed to connect to DNS server %s: %v", server, err)
+			lastErr = err
+			d.logger.Debug("TCP DNS query via %s failed: %v", server, err)
 			continue
 		}
-		defer conn.Close()
-
-		// Set deadline
-		conn.SetDeadline(time.Now().Add(5 * time.Second))
-
-		pack, err := req.Pack()
-		if err != nil {
-			lastErr = fmt.Errorf("failed to pack DNS message: %w", err)
-			continue
-		}
-
-		// DNS over TCP requires a 2-byte length prefix
-		length := uint16(len(pack))
-		lengthBytes := []byte{byte(length >> 8), byte(length & 0xff)}
-
-		_, err = conn.Write(lengthBytes)
-		if err != nil {
-			lastErr = fmt.Errorf("failed to write length to %s: %w", server, err)
-			d.logger.Debug("Failed to write length to %s: %v", server, err)
-			continue
-		}
-
-		_, err = conn.Write(pack)
-		if err != nil {
-			lastErr = fmt.Errorf("failed to write to %s: %w", server, err)
-			d.logger.Debug("Failed to write DNS query to %s: %v", server, err)
-			continue
-		}
-
-		// Read 2-byte length prefix
-		lenBuf := make([]byte, 2)
-		_, err = io.ReadFull(conn, lenBuf)
-		if err != nil {
-			lastErr = fmt.Errorf("failed to read length from %s: %w", server, err)
-			d.logger.Debug("Failed to read length from %s: %v", server, err)
-			continue
-		}
-		respLength := int(lenBuf[0])<<8 | int(lenBuf[1])
-
-		// Read response
-		buf := make([]byte, respLength)
-		_, err = io.ReadFull(conn, buf)
-		if err != nil {
-			lastErr = fmt.Errorf("failed to read from %s: %w", server, err)
-			d.logger.Debug("Failed to read DNS response from %s: %v", server, err)
-			continue
-		}
-
-		reply := &dns.Msg{}
-		if err := reply.Unpack(buf); err != nil {
-			lastErr = fmt.Errorf("failed to unpack DNS response: %w", err)
-			d.logger.Debug("Failed to unpack DNS response from %s: %v", server, err)
-			continue
-		}
-
 		d.logger.Debug("Successfully resolved via TCP DNS server %s", server)
 		return reply, nil
 	}
 
-	return nil, fmt.Errorf("all DNS servers failed: %v", lastErr)
+	return nil, fmt.Errorf("all DNS servers failed: %w", lastErr)
+}
+
+func (d *TunnelResolvingDialer) queryTCPServer(server string, pack []byte) (*dns.Msg, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), d.timeout)
+	defer cancel()
+
+	conn, err := d.next.DialContext(ctx, "tcp", server)
+	if err != nil {
+		return nil, fmt.Errorf("failed to dial %s: %w", server, err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(d.timeout))
+
+	// DNS over TCP requires a 2-byte length prefix (RFC 1035 4.2.2)
+	msg := make([]byte, 2+len(pack))
+	binary.BigEndian.PutUint16(msg, uint16(len(pack)))
+	copy(msg[2:], pack)
+	if _, err := conn.Write(msg); err != nil {
+		return nil, fmt.Errorf("failed to write to %s: %w", server, err)
+	}
+
+	var lenBuf [2]byte
+	if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
+		return nil, fmt.Errorf("failed to read length from %s: %w", server, err)
+	}
+	buf := make([]byte, binary.BigEndian.Uint16(lenBuf[:]))
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return nil, fmt.Errorf("failed to read from %s: %w", server, err)
+	}
+
+	reply := &dns.Msg{}
+	if err := reply.Unpack(buf); err != nil {
+		return nil, fmt.Errorf("failed to unpack DNS response from %s: %w", server, err)
+	}
+	if reply.Id != packedID(pack) {
+		return nil, fmt.Errorf("DNS response ID mismatch from %s", server)
+	}
+	return reply, nil
+}
+
+// packedID extracts the message ID from a packed DNS message
+func packedID(pack []byte) uint16 {
+	return binary.BigEndian.Uint16(pack)
 }
 
 func (d *TunnelResolvingDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {

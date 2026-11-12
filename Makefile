@@ -1,6 +1,6 @@
 PROGNAME = windscribe-proxy
 OUTSUFFIX = bin/$(PROGNAME)
-VERSION := $(shell git describe)
+VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo undefined)
 BUILDOPTS = -a -tags netgo -trimpath -asmflags -trimpath
 LDFLAGS = -ldflags '-s -w -extldflags "-static" -X main.version=$(VERSION)'
 LDFLAGS_NATIVE = -ldflags '-s -w -X main.version=$(VERSION)'
@@ -54,8 +54,8 @@ bin-windows-amd64: $(OUTSUFFIX).windows-amd64.exe
 bin-android-arm64: $(OUTSUFFIX).android-arm64
 # bin-android-arm: $(OUTSUFFIX).android-arm
 
-# $(OUTSUFFIX): $(src)
-# 	$(GO) build $(LDFLAGS_NATIVE) -o $@
+$(OUTSUFFIX): $(src)
+	$(GO) build $(LDFLAGS_NATIVE) -o $@
 
 $(OUTSUFFIX).linux-amd64: $(src)
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build $(BUILDOPTS) $(LDFLAGS) -o $@
@@ -150,7 +150,7 @@ run:
 install:
 	$(GO) install $(LDFLAGS_NATIVE) .
 
-.PHONY: clean all fmt install \
+.PHONY: clean all fmt install native bin-native \
 	bin-linux-amd64 \
 	bin-windows-amd64 \
 	bin-android-arm64

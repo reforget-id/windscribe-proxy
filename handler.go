@@ -45,6 +45,7 @@ func (s *ProxyHandler) HandleTunnel(wr http.ResponseWriter, req *http.Request) {
 		// Upgrade client connection
 		localconn, _, err := hijack(wr)
 		if err != nil {
+			conn.Close()
 			s.logger.Error("Can't hijack client connection: %v", err)
 			http.Error(wr, "Can't hijack client connection", http.StatusInternalServerError)
 			return
@@ -61,6 +62,7 @@ func (s *ProxyHandler) HandleTunnel(wr http.ResponseWriter, req *http.Request) {
 		flush(wr)
 		proxyh2(req.Context(), req.Body, wr, conn)
 	} else {
+		conn.Close()
 		s.logger.Error("Unsupported protocol version: %s", req.Proto)
 		http.Error(wr, "Unsupported protocol version.", http.StatusBadRequest)
 		return
@@ -76,7 +78,7 @@ func (s *ProxyHandler) HandleRequest(wr http.ResponseWriter, req *http.Request) 
 	resp, err := s.httptransport.RoundTrip(req)
 	if err != nil {
 		s.logger.Error("HTTP fetch error: %v", err)
-		http.Error(wr, "Server Error", http.StatusInternalServerError)
+		http.Error(wr, "Bad Gateway", http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()

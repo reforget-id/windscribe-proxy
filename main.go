@@ -8,7 +8,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"math/rand"
 	"net"
@@ -140,7 +139,7 @@ func run() int {
 	var caPool *x509.CertPool
 	if args.caFile != "" {
 		caPool = x509.NewCertPool()
-		certs, err := ioutil.ReadFile(args.caFile)
+		certs, err := os.ReadFile(args.caFile)
 		if err != nil {
 			mainLogger.Error("Can't load CA file: %v", err)
 			return 15
@@ -296,7 +295,7 @@ func run() int {
 	err = http.ListenAndServe(args.bindAddress, handler)
 	mainLogger.Critical("Server terminated with a reason: %v", err)
 	mainLogger.Info("Shutting down...")
-	return 0
+	return 1
 }
 
 type locationPair struct {
@@ -407,7 +406,7 @@ func loadState(filename string) (*wndclient.WndClientState, error) {
 }
 
 func saveState(filename string, state *wndclient.WndClientState) error {
-	file, err := os.OpenFile(filename, os.O_WRONLY|os.O_CREATE, 0600)
+	file, err := os.OpenFile(filename, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		return err
 	}
