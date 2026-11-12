@@ -2,13 +2,11 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -159,7 +157,7 @@ func (d *ProxyDialer) DialContext(ctx context.Context, network, address string) 
 		return nil, err
 	}
 
-	proxyResp, err := readResponse(conn, req)
+	proxyResp, bconn, err := readResponse(conn, req)
 	if err != nil {
 		return nil, err
 	}
@@ -170,38 +168,37 @@ func (d *ProxyDialer) DialContext(ctx context.Context, network, address string) 
 
 	conn.SetDeadline(time.Time{})
 	ok = true
-	return conn, nil
+	return bconn, nil
 }
 
 func (d *ProxyDialer) Dial(network, address string) (net.Conn, error) {
 	return d.DialContext(context.Background(), network, address)
 }
 
-func readResponse(r io.Reader, req *http.Request) (*http.Response, error) {
-	endOfResponse := []byte("\r\n\r\n")
-	buf := &bytes.Buffer{}
-	b := make([]byte, 1)
-	for {
-		n, err := r.Read(b)
-		if n < 1 && err == nil {
-			continue
-		}
-
-		buf.Write(b)
-		sl := buf.Bytes()
-		if len(sl) < len(endOfResponse) {
-			continue
-		}
-
-		if bytes.Equal(sl[len(sl)-4:], endOfResponse) {
-			break
-		}
-
-		if err != nil {
-			return nil, err
-		}
+// readResponse reads the proxy's reply to a CONNECT request. It returns
+// the response and a conn that must be used from now on: bytes the target
+// sent right after the response headers may already sit in the read buffer,
+// so they are replayed before further reads from the underlying conn.
+func readResponse(conn net.Conn, req *http.Request) (*http.Response, net.Conn, error) {
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, req)
+	if err != nil {
+		return nil, nil, err
 	}
-	return http.ReadResponse(bufio.NewReader(buf), req)
+	if br.Buffered() > 0 {
+		return resp, &bufferedConn{Conn: conn, r: br}, nil
+	}
+	return resp, conn, nil
+}
+
+// bufferedConn is a net.Conn whose reads drain a bufio.Reader first
+type bufferedConn struct {
+	net.Conn
+	r *bufio.Reader
+}
+
+func (c *bufferedConn) Read(b []byte) (int, error) {
+	return c.r.Read(b)
 }
 
 type FakeSNIDialer struct {

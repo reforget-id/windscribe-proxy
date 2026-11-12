@@ -144,13 +144,16 @@ clean:
 fmt:
 	$(GO) fmt ./...
 
+test:
+	$(GO) test -race ./...
+
 run:
 	$(GO) run $(LDFLAGS) .
 
 install:
 	$(GO) install $(LDFLAGS_NATIVE) .
 
-.PHONY: clean all fmt install native bin-native \
+.PHONY: clean all fmt test install native bin-native \
 	bin-linux-amd64 \
 	bin-windows-amd64 \
 	bin-android-arm64

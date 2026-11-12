@@ -14,8 +14,10 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"sort"
 	"strconv"
+	"syscall"
 	"time"
 
 	xproxy "golang.org/x/net/proxy"
@@ -291,11 +293,37 @@ func run() int {
 
 	mainLogger.Info("Starting proxy server...")
 	handler := NewProxyHandler(finalDialer, proxyLogger)
+	srv := &http.Server{
+		Addr:              args.bindAddress,
+		Handler:           handler,
+		ReadHeaderTimeout: 30 * time.Second,
+		IdleTimeout:       5 * time.Minute,
+		// No Read/WriteTimeout: CONNECT tunnels are long-lived
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	srvErr := make(chan error, 1)
+	go func() {
+		srvErr <- srv.ListenAndServe()
+	}()
 	mainLogger.Info("Init complete.")
-	err = http.ListenAndServe(args.bindAddress, handler)
-	mainLogger.Critical("Server terminated with a reason: %v", err)
-	mainLogger.Info("Shutting down...")
-	return 1
+
+	select {
+	case err = <-srvErr:
+		mainLogger.Critical("Server terminated with a reason: %v", err)
+		return 1
+	case <-ctx.Done():
+		stop() // a second signal kills the process immediately
+		mainLogger.Info("Shutting down...")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			mainLogger.Warning("Graceful shutdown incomplete: %v", err)
+		}
+		return 0
+	}
 }
 
 type locationPair struct {

@@ -23,6 +23,9 @@ jobs:
         with:
           go-version: 'stable'
       
+      - name: Test
+        run: go test -race ./...
+
       - name: Create tag
         run: |
           git config user.name "GitHub Actions"

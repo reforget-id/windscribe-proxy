@@ -77,19 +77,60 @@ func NewTunnelResolvingDialer(dohUpstream string, timeout time.Duration, next Co
 	return d, nil
 }
 
+// Negative caching bounds (RFC 2308): NXDOMAIN/NODATA answers are cached
+// for the SOA minimum TTL, clamped to this range.
+const (
+	negCacheDefaultTTL = 30 * time.Second
+	negCacheMaxTTL     = 5 * time.Minute
+)
+
+// dnsResult is what the DNS caches store: either a list of addresses or a
+// definitive negative answer (NXDOMAIN / no records of the requested type).
+type dnsResult struct {
+	addrs []string
+	err   error
+}
+
 func (d *TunnelResolvingDialer) resolveA(domain string) (interface{}, time.Duration, error) {
 	d.logger.Debug("resolveA(%#v) via tunnel", domain)
-	return d.resolve(domain, dns.TypeA)
+	return d.resolveCached(domain, dns.TypeA)
 }
 
 func (d *TunnelResolvingDialer) resolveAAAA(domain string) (interface{}, time.Duration, error) {
 	d.logger.Debug("resolveAAAA(%#v) via tunnel", domain)
-	return d.resolve(domain, dns.TypeAAAA)
+	return d.resolveCached(domain, dns.TypeAAAA)
 }
 
-func (d *TunnelResolvingDialer) resolve(domain string, typ uint16) (string, time.Duration, error) {
+// resolveCached adapts resolve to the ttlcache loader signature. Definitive
+// negative answers are stored in the cache; transient failures are not.
+func (d *TunnelResolvingDialer) resolveCached(domain string, typ uint16) (interface{}, time.Duration, error) {
+	addrs, ttl, err := d.resolve(domain, typ)
+	var neg *negativeAnswerError
+	if errors.As(err, &neg) {
+		return dnsResult{err: err}, ttl, nil
+	}
+	if err != nil {
+		return nil, 0, err
+	}
+	return dnsResult{addrs: addrs}, ttl, nil
+}
+
+// negativeAnswerError is a definitive "this name has no such records" answer
+type negativeAnswerError struct {
+	domain string
+	reason string
+}
+
+func (e *negativeAnswerError) Error() string {
+	return fmt.Sprintf("DNS lookup for %s: %s", e.domain, e.reason)
+}
+
+// resolve returns all addresses of the requested type with the smallest TTL
+// among them. A definitive negative answer is returned as *negativeAnswerError
+// together with the duration it may be cached for.
+func (d *TunnelResolvingDialer) resolve(domain string, typ uint16) ([]string, time.Duration, error) {
 	if len(domain) == 0 {
-		return "", 0, errors.New("empty domain name")
+		return nil, 0, errors.New("empty domain name")
 	}
 	domain = absDomain(domain)
 
@@ -116,23 +157,63 @@ func (d *TunnelResolvingDialer) resolve(domain string, typ uint16) (string, time
 	}
 
 	if err != nil {
-		return "", 0, err
+		return nil, 0, err
 	}
 
-	if reply.Rcode != dns.RcodeSuccess {
-		return "", 0, fmt.Errorf("DNS query for %s failed: %s", domain, dns.RcodeToString[reply.Rcode])
+	switch reply.Rcode {
+	case dns.RcodeSuccess:
+	case dns.RcodeNameError:
+		return nil, negativeTTL(reply), &negativeAnswerError{domain, "no such host"}
+	default:
+		return nil, 0, fmt.Errorf("DNS query for %s failed: %s", domain, dns.RcodeToString[reply.Rcode])
 	}
 
-	// Parse response
+	var addrs []string
+	var minTTL uint32
 	for _, rr := range reply.Answer {
-		if a, ok := rr.(*dns.A); ok && typ == dns.TypeA {
-			return a.A.String(), cacheTTL(a.Hdr.Ttl), nil
+		var addr string
+		switch v := rr.(type) {
+		case *dns.A:
+			if typ != dns.TypeA {
+				continue
+			}
+			addr = v.A.String()
+		case *dns.AAAA:
+			if typ != dns.TypeAAAA {
+				continue
+			}
+			addr = v.AAAA.String()
+		default:
+			continue
 		}
-		if aaaa, ok := rr.(*dns.AAAA); ok && typ == dns.TypeAAAA {
-			return aaaa.AAAA.String(), cacheTTL(aaaa.Hdr.Ttl), nil
+		if len(addrs) == 0 || rr.Header().Ttl < minTTL {
+			minTTL = rr.Header().Ttl
+		}
+		addrs = append(addrs, addr)
+	}
+	if len(addrs) == 0 {
+		return nil, negativeTTL(reply), &negativeAnswerError{domain, "no records of requested type"}
+	}
+	return addrs, cacheTTL(minTTL), nil
+}
+
+// negativeTTL derives the negative caching duration from the SOA record in
+// the authority section (RFC 2308 section 5).
+func negativeTTL(reply *dns.Msg) time.Duration {
+	for _, rr := range reply.Ns {
+		if soa, ok := rr.(*dns.SOA); ok {
+			ttl := soa.Hdr.Ttl
+			if soa.Minttl < ttl {
+				ttl = soa.Minttl
+			}
+			d := cacheTTL(ttl)
+			if d > negCacheMaxTTL {
+				d = negCacheMaxTTL
+			}
+			return d
 		}
 	}
-	return "", 0, errors.New("no data in DNS response")
+	return negCacheDefaultTTL
 }
 
 // cacheTTL converts a DNS TTL to a cache duration. ttlcache treats a zero
@@ -260,44 +341,70 @@ func (d *TunnelResolvingDialer) DialContext(ctx context.Context, network, addres
 		return nil, err
 	}
 
-	if net.ParseIP(name) != nil || len(name) == 0 {
+	if net.ParseIP(name) != nil || len(name) == 0 || len(network) == 0 {
 		// Address is already in numeric form
-		return d.next.DialContext(ctx, network, address)
-	}
-
-	if len(network) == 0 {
 		return d.next.DialContext(ctx, network, address)
 	}
 
 	name = absDomain(name)
 	switch network[len(network)-1] {
 	case '4':
-		res, err := d.cache4.Get(name)
-		if err != nil {
-			return nil, err
-		}
-		name = res.(string)
+		return d.dialCached(ctx, d.cache4, network, name, port)
 	case '6':
-		res, err := d.cache6.Get(name)
-		if err != nil {
+		return d.dialCached(ctx, d.cache6, network, name, port)
+	default:
+		// IPv4 first; IPv6 is looked up only if IPv4 lookup or all IPv4 dials fail
+		conn, err := d.dialCached(ctx, d.cache4, network, name, port)
+		if err == nil || ctx.Err() != nil {
+			return conn, err
+		}
+		conn, err6 := d.dialCached(ctx, d.cache6, network, name, port)
+		if err6 == nil {
+			return conn, nil
+		}
+		var neg *negativeAnswerError
+		if errors.As(err6, &neg) {
+			// no IPv6 records: the IPv4 error is the more useful one
 			return nil, err
 		}
-		name = res.(string)
-	default:
-		// Try IPv4 first
-		res, err := d.cache4.Get(name)
-		if err != nil {
-			// Fall back to IPv6
-			res, err = d.cache6.Get(name)
-			if err != nil {
-				return nil, err
-			}
-		}
-		name = res.(string)
+		return nil, err6
 	}
-	newAddress := net.JoinHostPort(name, port)
-	d.logger.Debug("tunnel DNS resolve: %s => %s", address, newAddress)
-	return d.next.DialContext(ctx, network, newAddress)
+}
+
+// dialCached resolves name via cache and tries each address until one connects
+func (d *TunnelResolvingDialer) dialCached(ctx context.Context, cache *ttlcache.Cache, network, name, port string) (net.Conn, error) {
+	addrs, err := d.lookup(cache, name)
+	if err != nil {
+		return nil, err
+	}
+	var lastErr error
+	for _, ip := range addrs {
+		newAddress := net.JoinHostPort(ip, port)
+		d.logger.Debug("tunnel DNS resolve: %s => %s", name, newAddress)
+		conn, err := d.next.DialContext(ctx, network, newAddress)
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+		if ctx.Err() != nil {
+			break
+		}
+		d.logger.Debug("dial %s failed: %v", newAddress, err)
+	}
+	return nil, lastErr
+}
+
+// lookup returns cached addresses for name, resolving it if necessary
+func (d *TunnelResolvingDialer) lookup(cache *ttlcache.Cache, name string) ([]string, error) {
+	v, err := cache.Get(name)
+	if err != nil {
+		return nil, err
+	}
+	res := v.(dnsResult)
+	if res.err != nil {
+		return nil, res.err
+	}
+	return res.addrs, nil
 }
 
 func (d *TunnelResolvingDialer) Dial(network, address string) (net.Conn, error) {
