@@ -8,7 +8,6 @@ This implementation adds DNS tunneling functionality to windscribe-proxy, routin
 
 1. **Auto-detection of Windows DNS Configuration**
    - Automatically detects DoH (DNS over HTTPS) endpoints configured in Windows
-   - Reads DNS server settings from Windows registry
    - No manual configuration required on Windows systems
 
 2. **Custom DoH Upstream Support**
@@ -40,7 +39,6 @@ Main DNS tunneling implementation:
 Windows-specific DNS auto-detection:
 - Reads DoH configuration from Windows registry
 - Extracts DoH templates from `HKLM\SYSTEM\CurrentControlSet\Services\Dnscache\Parameters\DohSettings`
-- Detects DNS servers from network interface configuration
 - Build tag: `//go:build windows`
 
 ### windows_dns_stub.go
